@@ -1,0 +1,14 @@
+services:
+  base-kit:
+    build: .
+    volumes:
+      - .:/workspace
+      - cargo-registry:/usr/local/cargo/registry
+      - cargo-git:/usr/local/cargo/git
+    ports:
+      - "8080:8080"
+    command: ["trunk", "serve", "--address", "0.0.0.0", "--port", "8080"]
+
+volumes:
+  cargo-registry:
+  cargo-git:

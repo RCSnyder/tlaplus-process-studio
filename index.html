@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="TLA+ Process Studio — model any business process as a state machine, collect stakeholder feedback, and iterate with any LLM. 100% client-side, nothing leaves your browser."
+    />
+    <meta
+      name="keywords"
+      content="TLA+, state machine, business process, process modeling, stakeholder feedback, WASM, Rust"
+    />
+    <meta name="author" content="R. Cooper Snyder" />
+    <meta name="robots" content="index, follow" />
+    <link rel="canonical" href="https://tlaplus-process-studio.com/" />
+
+    <!-- Trunk: copy static assets to dist/ -->
+    <link data-trunk rel="copy-file" href="CNAME" />
+    <link data-trunk rel="copy-file" href="robots.txt" />
+    <link data-trunk rel="copy-file" href="sitemap.xml" />
+    <link data-trunk rel="copy-file" href="og-image.png" />
+    <link data-trunk rel="copy-file" href="favicon-32.png" />
+    <link data-trunk rel="copy-file" href="favicon-180.png" />
+    <link data-trunk rel="copy-file" href="favicon-192.png" />
+    <link data-trunk rel="copy-file" href="favicon-512.png" />
+
+    <!-- Favicons -->
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="favicon-180.png" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="TLA+ Process Studio" />
+    <meta
+      property="og:description"
+      content="Model any business process as a state machine, collect structured stakeholder feedback, and iterate toward an accurate shared model with any LLM. 100% client-side."
+    />
+    <meta property="og:url" content="https://tlaplus-process-studio.com/" />
+    <meta property="og:site_name" content="TLA+ Process Studio" />
+    <meta
+      property="og:image"
+      content="https://tlaplus-process-studio.com/og-image.png"
+    />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="TLA+ Process Studio" />
+    <meta
+      name="twitter:description"
+      content="Model any business process as a state machine, collect stakeholder feedback, iterate with any LLM. 100% client-side."
+    />
+    <meta
+      name="twitter:image"
+      content="https://tlaplus-process-studio.com/og-image.png"
+    />
+
+    <title>
+      TLA+ Process Studio — Model Business Processes as State Machines
+    </title>
+    <link data-trunk rel="css" href="style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+    <script>
+      mermaid.initialize({ startOnLoad: false, securityLevel: "loose" })
+      window.renderMermaid = async function (code) {
+        const el = document.getElementById("mermaid-target")
+        if (!el) return
+        const dark = window.matchMedia("(prefers-color-scheme: dark)").matches
+        mermaid.initialize({
+          startOnLoad: false,
+          theme: dark ? "dark" : "default",
+          securityLevel: "loose"
+        })
+        try {
+          // Remove previous render to avoid ID conflicts
+          const old = document.getElementById("mermaid-graph")
+          if (old) old.remove()
+          const { svg } = await mermaid.render("mermaid-graph", code)
+          el.innerHTML = svg
+        } catch (e) {
+          el.innerHTML =
+            '<p style="color:var(--warn);padding:14px">Diagram error: ' +
+            e.message +
+            "</p>"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <!--
+    AGENT-INSTRUCTIONS: TLA+ Process Studio — 100% client-side, zero server calls.
+
+    READING STATE (most idiomatic approach):
+      1. localStorage.getItem("tla_studio_source")           → raw TLA+ spec text
+      2. JSON.parse(localStorage.getItem("tla_studio_comments") || "[]")
+         → [{target:"StateName", author:"Name", text:"Comment"}, ...]
+      3. document.querySelector(".editor-area").value         → current editor content
+
+    WRITING STATE BACK:
+      4. Set editor value:
+         const ta = document.querySelector(".editor-area");
+         const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+         setter.call(ta, newSpec);
+         ta.dispatchEvent(new Event('input',{bubbles:true}));
+      5. Click parse: document.querySelector(".btn-primary").click()
+
+    WORKFLOW: paste TLA+ → parse → review states (Model tab) → collect comments →
+              export with iteration prompt (Tools tab) → LLM revises → paste back → repeat.
+
+    UI STRUCTURE: Topbar (stats+privacy) | Left pane (source editor) | Right pane (Model/Reference/Tools tabs)
+    PRIVACY: No server, no API, no analytics, no cookies. All data in localStorage only.
+    -->
+    <div id="app"></div>
+  </body>
+</html>
