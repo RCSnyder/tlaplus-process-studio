@@ -143,6 +143,7 @@ const STORAGE_SOURCE_KEY: &str = "tla_studio_source";
 const STORAGE_SNAPSHOTS_KEY: &str = "tla_studio_snapshots";
 const STORAGE_THEME_KEY: &str = "tla_studio_theme";
 
+
 // ─── Prompt constants ───
 
 const BOOTSTRAP_PROMPT: &str = r#"You are a business-process discovery partner. Your job is to help me build a shared model of a real-world process as a TLA+ state machine. The people who do this work every day are the experts — your role is to capture their knowledge faithfully, including the clever adaptations and hard-won experience that never make it into official documentation.
@@ -790,6 +791,30 @@ fn format_ts(ms: f64) -> String {
     )
 }
 
+// ─── Document origin: single source of truth for what's loaded ───
+
+#[derive(Clone, PartialEq)]
+enum DocumentOrigin {
+    Empty,
+    Example(usize),
+    Local,
+    Share(SharePayload),
+}
+
+fn resolve_origin() -> DocumentOrigin {
+    if let Some(payload) = load_share_from_url() {
+        return DocumentOrigin::Share(payload);
+    }
+    if let Some(idx) = find_example_index_from_url() {
+        return DocumentOrigin::Example(idx);
+    }
+    // Any non-empty localStorage content means the user has prior work
+    if load_source().map_or(false, |s| !s.trim().is_empty()) {
+        return DocumentOrigin::Local;
+    }
+    DocumentOrigin::Empty
+}
+
 // ─── Share URL helpers ───
 
 fn build_share_url(source: &str, comments: &[UserComment]) -> Option<String> {
@@ -813,11 +838,88 @@ fn load_share_from_url() -> Option<SharePayload> {
 
 fn clear_url_hash() {
     if let Some(window) = window() {
-        let _ = window.history().and_then(|h| h.replace_state_with_url(&JsValue::NULL, "", Some(&window.location().pathname().unwrap_or_default())));
+        let path = window.location().pathname().unwrap_or_default();
+        let hash = window.location().hash().unwrap_or_default();
+        // Strip tab-only hashes (e.g. #guide) but keep share hashes
+        let keep_hash = if hash.starts_with("#share=") { hash } else { String::new() };
+        let _ = window.history().and_then(|h| h.replace_state_with_url(&JsValue::NULL, "", Some(&format!("{}{}", path, keep_hash))));
+    }
+}
+
+/// Transition URL to "user's local work" — clears ?example= but preserves tab hash.
+fn set_url_local() {
+    if let Some(w) = web_sys::window() {
+        let path = w.location().pathname().unwrap_or_default();
+        let hash = w.location().hash().unwrap_or_default();
+        let keep_hash = if hash.starts_with("#share=") { String::new() } else { hash };
+        let _ = w.history().and_then(|h| h.replace_state_with_url(&JsValue::NULL, "", Some(&format!("{}{}", path, keep_hash))));
+    }
+}
+
+/// Push an example URL onto the history stack (enables back-button navigation).
+fn push_url_example(slug: &str) {
+    if let Some(w) = web_sys::window() {
+        let path = w.location().pathname().unwrap_or_default();
+        let hash = w.location().hash().unwrap_or_default();
+        let keep_hash = if hash.starts_with("#share=") { String::new() } else { hash };
+        let new_url = format!("{}?example={}{}", path, slug, keep_hash);
+        let _ = w.history().and_then(|h| h.push_state_with_url(&JsValue::NULL, "", Some(&new_url)));
+    }
+}
+
+fn find_example_index_from_url() -> Option<usize> {
+    let search = window()?.location().search().ok()?;
+    if !search.starts_with('?') { return None; }
+    for pair in search[1..].split('&') {
+        let mut kv = pair.splitn(2, '=');
+        let key = kv.next()?;
+        let val = kv.next().unwrap_or("");
+        if key == "example" {
+            let decoded = js_sys::decode_uri_component(val).ok()?.as_string()?;
+            let slug = decoded.to_lowercase().replace(' ', "-");
+            for (idx, &(name, _)) in EXAMPLE_SPECS.iter().enumerate() {
+                let spec_slug = name.to_lowercase().replace(' ', "-");
+                if spec_slug == slug {
+                    return Some(idx);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn read_tab_from_hash() -> Option<String> {
+    let hash = window()?.location().hash().ok()?;
+    let tab = hash.trim_start_matches('#');
+    match tab {
+        "model" | "prompts" | "versions" | "guide" => Some(tab.to_string()),
+        _ => None,
+    }
+}
+
+fn set_tab_hash(tab: &str) {
+    if let Some(w) = web_sys::window() {
+        let path = w.location().pathname().unwrap_or_default();
+        let search = w.location().search().unwrap_or_default();
+        let hash = if tab == "model" { String::new() } else { format!("#{}", tab) };
+        let new_url = format!("{}{}{}", path, search, hash);
+        let _ = w.history().and_then(|h| h.replace_state_with_url(&JsValue::NULL, "", Some(&new_url)));
     }
 }
 
 // ─── Export builders ───
+
+fn format_comment_line(c: &UserComment) -> String {
+    let chain_prefix = match &c.chain {
+        Some(ch) if ch.len() > 1 => format!("[path: {}] ", ch.join(" → ")),
+        _ => String::new(),
+    };
+    if let Some(ref cat) = c.category {
+        format!("  [{}] ({}) {}{}\n", cat.to_uppercase(), c.author, chain_prefix, c.text)
+    } else {
+        format!("  ({}) {}{}\n", c.author, chain_prefix, c.text)
+    }
+}
 
 fn build_export(source: &str, comments: &[UserComment], states: &[String], iter_prompt: &str) -> String {
     let mut out = String::new();
@@ -830,11 +932,7 @@ fn build_export(source: &str, comments: &[UserComment], states: &[String], iter_
         if !sc.is_empty() {
             out.push_str(&format!("\n[{}]\n", state));
             for c in &sc {
-                if let Some(ref cat) = c.category {
-                    out.push_str(&format!("  [{}] ({}) {}\n", cat.to_uppercase(), c.author, c.text));
-                } else {
-                    out.push_str(&format!("  ({}) {}\n", c.author, c.text));
-                }
+                out.push_str(&format_comment_line(c));
             }
         }
     }
@@ -856,11 +954,7 @@ fn build_state_comments_bundle(source: &str, comments: &[UserComment], states: &
         if !sc.is_empty() {
             out.push_str(&format!("\n[{}]\n", state));
             for c in &sc {
-                if let Some(ref cat) = c.category {
-                    out.push_str(&format!("  [{}] ({}) {}\n", cat.to_uppercase(), c.author, c.text));
-                } else {
-                    out.push_str(&format!("  ({}) {}\n", c.author, c.text));
-                }
+                out.push_str(&format_comment_line(c));
             }
         }
     }
@@ -886,11 +980,7 @@ fn build_agent_meta(source: &str, comments: &[UserComment], states: &[String], s
         if !sc.is_empty() {
             meta.push_str(&format!("[{}]\n", state));
             for c in &sc {
-                if let Some(ref cat) = c.category {
-                    meta.push_str(&format!("  [{}] ({}) {}\n", cat.to_uppercase(), c.author, c.text));
-                } else {
-                    meta.push_str(&format!("  ({}) {}\n", c.author, c.text));
-                }
+                meta.push_str(&format_comment_line(c));
             }
         }
     }
@@ -948,25 +1038,29 @@ fn parse_workspace_export(json: &str) -> Option<WorkspaceExport> {
 
 #[function_component(App)]
 fn app() -> Html {
-    // Check for share URL on first render
-    let shared = use_state(|| {
-        if let Some(payload) = load_share_from_url() {
-            clear_url_hash();
-            save_source(&payload.source);
-            save_comments(&payload.comments);
-            Some(payload)
-        } else {
-            None
+    // Resolve document origin once on mount
+    let origin = use_state(resolve_origin);
+
+    // Bootstrap from origin
+    let source = use_state(|| {
+        match &*origin {
+            DocumentOrigin::Share(p) => {
+                // Persist share payload and transition URL to local
+                save_source(&p.source);
+                save_comments(&p.comments);
+                clear_url_hash();
+                p.source.clone()
+            }
+            DocumentOrigin::Example(idx) => {
+                EXAMPLE_SPECS.get(*idx).map_or(String::new(), |&(_, spec)| spec.to_string())
+            }
+            DocumentOrigin::Local => {
+                load_source().unwrap_or_default()
+            }
+            DocumentOrigin::Empty => String::new(),
         }
     });
-    let source = use_state(|| {
-        if let Some(ref p) = *shared { p.source.clone() }
-        else { load_source().unwrap_or_else(|| SAMPLE_TLA.to_string()) }
-    });
-    let last_source_hash = use_state(|| {
-        if let Some(ref p) = *shared { hash_source(&p.source) }
-        else { hash_source(&load_source().unwrap_or_else(|| SAMPLE_TLA.to_string())) }
-    });
+    let last_source_hash = use_state(|| hash_source(&source));
     let parsed = {
         let source_text = (*source).clone();
         use_memo(source_text, |text| parse_tla(text))
@@ -974,16 +1068,22 @@ fn app() -> Html {
 
     let sim_chain = use_state(|| vec![parsed.start_state()]);
     let comments = use_state(|| {
-        if let Some(ref p) = *shared { p.comments.clone() }
-        else { load_comments() }
+        match &*origin {
+            DocumentOrigin::Share(p) => p.comments.clone(),
+            _ => load_comments(),
+        }
     });
     let comment_target = use_state(|| Some(parsed.start_state()));
     let comment_draft = use_state(String::new);
     let comment_author = use_state(|| "Anonymous".to_string());
     let editing_comment_idx = use_state(|| Option::<usize>::None);
     let editing_comment_text = use_state(String::new);
-    let active_tab = use_state(|| "model".to_string());
-    let active_panel = use_state(|| Option::<String>::None);
+    let active_tab = use_state(|| read_tab_from_hash().unwrap_or_else(|| "model".to_string()));
+    // Dropdown selection is derived from origin — no independent state
+    let selected_example = match &*origin {
+        DocumentOrigin::Example(idx) => Some(*idx),
+        _ => None,
+    };
     let snapshots = use_state(load_snapshots);
     let snap_name = use_state(String::new);
     let import_text = use_state(String::new);
@@ -991,15 +1091,22 @@ fn app() -> Html {
     let ws_import_text = use_state(String::new);
     let ws_import_msg = use_state(|| Option::<String>::None);
     let theme = use_state(load_theme);
+    let show_welcome = use_state(|| true);
 
     // ── Source editing ──
     let on_source = {
         let source = source.clone();
+        let origin = origin.clone();
         Callback::from(move |e: InputEvent| {
             let ta: HtmlTextAreaElement = e.target_unchecked_into();
             let val = ta.value();
             save_source(&val);
             source.set(val);
+            // First edit after loading an example → transition to local
+            if matches!(&*origin, DocumentOrigin::Example(_)) {
+                set_url_local();
+                origin.set(DocumentOrigin::Local);
+            }
         })
     };
 
@@ -1011,13 +1118,15 @@ fn app() -> Html {
         let snapshots = snapshots.clone();
         let sim_chain = sim_chain.clone();
         let comment_target = comment_target.clone();
+        let origin = origin.clone();
         Callback::from(move |e: Event| {
             let select: HtmlInputElement = e.target_unchecked_into();
             let idx_str = select.value();
-            // Reset the select back to the placeholder
-            select.set_value("");
             if let Ok(idx) = idx_str.parse::<usize>() {
-                if let Some(&(_, spec)) = EXAMPLE_SPECS.get(idx) {
+                if let Some(&(name, spec)) = EXAMPLE_SPECS.get(idx) {
+                    let slug = name.to_lowercase().replace(' ', "-");
+                    push_url_example(&slug);
+                    origin.set(DocumentOrigin::Example(idx));
                     // Auto-save current state before loading example
                     let prev_source = load_source().unwrap_or_default();
                     if !prev_source.trim().is_empty() {
@@ -1239,10 +1348,11 @@ fn app() -> Html {
         })
     };
 
-    // ── Tabs (clicking a tab closes any open panel) ──
-    let on_tab_model = { let t = active_tab.clone(); let p = active_panel.clone(); Callback::from(move |_| { t.set("model".to_string()); p.set(None); }) };
-    let on_tab_prompts = { let t = active_tab.clone(); let p = active_panel.clone(); Callback::from(move |_| { t.set("prompts".to_string()); p.set(None); }) };
-    let on_tab_versions = { let t = active_tab.clone(); let p = active_panel.clone(); Callback::from(move |_| { t.set("versions".to_string()); p.set(None); }) };
+    // ── Tabs ──
+    let on_tab_model = { let t = active_tab.clone(); Callback::from(move |_| { t.set("model".to_string()); set_tab_hash("model"); }) };
+    let on_tab_prompts = { let t = active_tab.clone(); Callback::from(move |_| { t.set("prompts".to_string()); set_tab_hash("prompts"); }) };
+    let on_tab_versions = { let t = active_tab.clone(); Callback::from(move |_| { t.set("versions".to_string()); set_tab_hash("versions"); }) };
+    let on_tab_guide = { let t = active_tab.clone(); Callback::from(move |_| { t.set("guide".to_string()); set_tab_hash("guide"); }) };
 
     // ── Share ──
     let on_share = {
@@ -1373,6 +1483,7 @@ fn app() -> Html {
         let snapshots = snapshots.clone();
         let sim_chain = sim_chain.clone();
         let comment_target = comment_target.clone();
+        let origin = origin.clone();
         Callback::from(move |_| {
             let text = (*ws_import_text).trim().to_string();
             if text.is_empty() { ws_import_msg.set(Some("Paste a workspace JSON first.".to_string())); return; }
@@ -1393,6 +1504,9 @@ fn app() -> Html {
                     let machine = parse_tla(&ws.source);
                     sim_chain.set(vec![machine.start_state()]);
                     comment_target.set(None);
+                    // Transition URL to local
+                    set_url_local();
+                    origin.set(DocumentOrigin::Local);
                     ws_import_msg.set(Some(format!("Workspace restored ({} versions)", n_snaps)));
                     ws_import_text.set(String::new());
                     show_toast("Restored!");
@@ -1434,9 +1548,8 @@ fn app() -> Html {
     };
     let storage_count = (*comments).len();
     let tab = (*active_tab).clone();
-    let panel = (*active_panel).clone();
     let can_submit_comment = !(**comment_draft).trim().is_empty();
-    let compose_placeholder = "Comment for Future LLM Audit. Include: missing step, mismatch with reality, failure mode, workaround, naming issue, or scope question.".to_string();
+    let compose_placeholder = "What's wrong, missing, or unclear about this step? Your comment ships with the spec when iterating with an LLM — be specific.".to_string();
 
     // Callback for diagram node clicks — advances chain (only available targets are clickable)
     let on_diagram_click = {
@@ -1464,13 +1577,19 @@ fn app() -> Html {
         })
     };
 
+    let on_dismiss_welcome = {
+        let show_welcome = show_welcome.clone();
+        Callback::from(move |_: MouseEvent| {
+            show_welcome.set(false);
+        })
+    };
+
     // Trigger diagram zoom init when Model tab is active
     {
         let tab2 = tab.clone();
-        let panel2 = panel.clone();
         let parsed_states_len = parsed.states.len();
-        use_effect_with((tab2, panel2, parsed_states_len), move |(tab, panel, len)| {
-            if tab == "model" && panel.is_none() && *len > 0 {
+        use_effect_with((tab2, parsed_states_len), move |(tab, len)| {
+            if tab == "model" && *len > 0 {
                 // Small delay to let the DOM render the SVG first
                 let window = web_sys::window().unwrap();
                 let closure = wasm_bindgen::closure::Closure::once_into_js(move || {
@@ -1510,6 +1629,7 @@ fn app() -> Html {
             <header class="topbar">
                 <div class="topbar-left">
                     <h1 class="app-title">{"TLA+ Process Studio"}</h1>
+                    <span class="app-tagline">{"Model it before you automate it. Collaboratively."}</span>
                 </div>
                 <div class="topbar-right">
                     <span class="privacy-badge">{"100% client-side \u{00B7} nothing leaves your browser"}</span>
@@ -1526,18 +1646,36 @@ fn app() -> Html {
                 </div>
             </header>
 
+            // ── Welcome modal ──
+            { if *show_welcome { html! {
+                <div class="welcome-overlay" onclick={on_dismiss_welcome.clone()}>
+                    <div class="welcome-modal" onclick={Callback::from(|e: MouseEvent| e.stop_propagation())}>
+                        <h2 class="welcome-title">{"TLA+ Process Studio"}</h2>
+                        <p class="welcome-bluf">{"Reduce ambiguity about how a process works before you build anything."}</p>
+                        <p class="welcome-body">{"Model any business process as a state machine, walk stakeholders through it, and collect their corrections. Structured thinking replaces ambiguous conversations with a visible, shared model. The result is a precise process definition you can use for requirements, system design, and/or as additional input for agentic software engineering systems."}</p>
+                        <p class="welcome-who">{"For teams designing systems, facilitators running process discovery, and anyone who wants to know what to build before they build it."}</p>
+                        <p class="welcome-hint">{"Select an example spec from the dropdown to see it in action."}</p>
+                        <p class="welcome-privacy">{"\u{1F512} Runs entirely in your browser. No server, no sign-up, no data leaves the page."}</p>
+                        <button class="btn btn-primary welcome-dismiss" onclick={on_dismiss_welcome.clone()}>{"Got it"}</button>
+                    </div>
+                </div>
+            }} else { html!{} } }
+
             // ── Workspace ──
             <div class="workspace">
 
                 // ── Left pane: editor ──
                 <div class="pane pane-left">
                     <div class="pane-header">
-                        <span class="pane-label">{"Source"}</span>
+                        <span class="pane-label">{"Source Editor"}</span>
                         <div class="toolbar">
                             <select class="example-select" onchange={on_example}>
-                                <option value="" selected=true disabled=true>{"Load example\u{2026}"}</option>
-                                { for EXAMPLE_SPECS.iter().enumerate().map(|(i, (name, _))| html! {
-                                    <option value={i.to_string()}>{*name}</option>
+                                <option value="" selected={selected_example.is_none()} disabled=true>{"Load example\u{2026}"}</option>
+                                { for EXAMPLE_SPECS.iter().enumerate().map(|(i, (name, _))| {
+                                    let is_sel = selected_example == Some(i);
+                                    html! {
+                                        <option value={i.to_string()} selected={is_sel}>{*name}</option>
+                                    }
                                 }) }
                             </select>
                             <button class="btn btn-primary" data-action="parse" onclick={on_parse}>{"Parse"}</button>
@@ -1554,21 +1692,15 @@ fn app() -> Html {
                 // ── Right pane ──
                 <div class="pane pane-right">
                     <div class="tab-bar" role="tablist">
-                        <button role="tab" aria-selected={if tab == "model" && panel.is_none() { "true" } else { "false" }} class={if tab == "model" && panel.is_none() { "tab tab-active" } else { "tab" }} onclick={on_tab_model}>{"Model"}</button>
-                        <button role="tab" aria-selected={if tab == "prompts" && panel.is_none() { "true" } else { "false" }} class={if tab == "prompts" && panel.is_none() { "tab tab-active" } else { "tab" }} onclick={on_tab_prompts}>{"Prompts"}</button>
-                        <button role="tab" aria-selected={if tab == "versions" && panel.is_none() { "true" } else { "false" }} class={if tab == "versions" && panel.is_none() { "tab tab-active" } else { "tab" }} onclick={on_tab_versions}>{format!("Versions{}", if (*snapshots).is_empty() { String::new() } else { format!(" ({})", (*snapshots).len()) })}</button>
-                        <div class="tab-spacer" />
-                        <input class="input-sm header-snap-name" placeholder={parsed.module_name.clone()} value={snap_name_value.clone()} oninput={on_snap_name.clone()} />
-                        <div class="header-save-wrap">
-                            <button class="tbtn" data-action="save-snapshot" onclick={on_save_snapshot.clone()}>{"\u{1F4BE} Save"}</button>
-                        </div>
-                        <button class="tbtn" onclick={on_copy_state_comments}>{"\u{1F4DD} Copy state + comments"}</button>
-                        <button class="tbtn" onclick={on_share}>{"\u{1F517} Share"}</button>
+                        <button role="tab" aria-selected={if tab == "model" { "true" } else { "false" }} class={if tab == "model" { "tab tab-active" } else { "tab" }} onclick={on_tab_model}>{"Model"}</button>
+                        <button role="tab" aria-selected={if tab == "prompts" { "true" } else { "false" }} class={if tab == "prompts" { "tab tab-active" } else { "tab" }} onclick={on_tab_prompts}>{"Prompts"}</button>
+                        <button role="tab" aria-selected={if tab == "versions" { "true" } else { "false" }} class={if tab == "versions" { "tab tab-active" } else { "tab" }} onclick={on_tab_versions}>{format!("Versions{}", if (*snapshots).is_empty() { String::new() } else { format!(" ({})", (*snapshots).len()) })}</button>
+                        <button role="tab" aria-selected={if tab == "guide" { "true" } else { "false" }} class={if tab == "guide" { "tab tab-active" } else { "tab" }} onclick={on_tab_guide}>{"Guide"}</button>
                     </div>
                     <div class="tab-content" role="tabpanel">
 
                         // ═══ PANEL: Prompts (New spec + Iterate + Agent) ═══
-                        { if panel.is_none() && tab == "prompts" {
+                        { if tab == "prompts" {
                             let bootstrap_text = active_bootstrap.to_string();
                             let bootstrap_copy = active_bootstrap.to_string();
                             let syntax_text = BASIC_SYNTAX_PROMPT.to_string();
@@ -1635,31 +1767,34 @@ fn app() -> Html {
                         }} else { html!{} } }
 
                         // ═══ PANEL: Versions ═══
-                        { if panel.is_none() && tab == "versions" {
+                        { if tab == "versions" {
                             let kb = storage_size_kb();
                             let size_class = if kb > 4096.0 { "size-pill size-warn" } else { "size-pill" };
                             let size_label = if kb >= 1024.0 { format!("{:.1} MB stored", kb / 1024.0) } else { format!("{:.0} KB stored", kb) };
                             html! {
                             <div class="tab-panel panel-fill">
-                                <section class="section panel-stretch">
-                                    <div class="section-bar">
-                                        <h2 class="section-title" style="margin:0">{"Versions"}<span class={size_class}>{size_label}</span></h2>
-                                        <div class="toolbar">
-                                            <input class="input-sm snap-name-input" placeholder="Name (optional)" value={snap_name_value.clone()} oninput={on_snap_name} />
-                                            <button class="btn btn-primary" onclick={on_save_snapshot}>{"Save current"}</button>
-                                        </div>
+                                // ── Header bar (pinned) ──
+                                <div class="section-bar" style="flex-shrink:0;padding-bottom:8px">
+                                    <h2 class="section-title" style="margin:0">{"Versions"}<span class={size_class}>{size_label}</span></h2>
+                                    <div class="toolbar">
+                                        <input class="input-sm snap-name-input" placeholder="Name (optional)" value={snap_name_value.clone()} oninput={on_snap_name.clone()} />
+                                        <button class="btn btn-primary" onclick={on_save_snapshot.clone()}>{"Save current"}</button>
                                     </div>
+                                </div>
 
+                                // ── Versions card (scrolls) ──
+                                <div class="versions-card">
                                     { if (*snapshots).is_empty() {
                                         html! { <p class="help-text">{"No saved versions yet. Save the current spec + comments, copy to share, or paste one to import."}</p> }
                                     } else { html! {
                                         <div class="snap-list">
-                                            { for (*snapshots).iter().enumerate().map(|(i, snap)| {
+                                            { for (*snapshots).iter().enumerate().rev().map(|(i, snap)| {
                                                 let source = source.clone();
                                                 let comments = comments.clone();
                                                 let last_source_hash = last_source_hash.clone();
                                                 let sim_chain = sim_chain.clone();
                                                 let comment_target = comment_target.clone();
+                                                let origin_load = origin.clone();
                                                 let snap_source = snap.source.clone();
                                                 let snap_comments = snap.comments.clone();
                                                 let snap_hash = snap.hash;
@@ -1667,7 +1802,6 @@ fn app() -> Html {
                                                 let cur_source_load = source.clone();
                                                 let cur_comments_load = comments.clone();
                                                 let on_load = Callback::from(move |_| {
-                                                    // Auto-backup current state before overwriting
                                                     let cur_src = (*cur_source_load).clone();
                                                     if !cur_src.trim().is_empty() {
                                                         let new_snaps = save_backup_snapshot("before loading version", &cur_src, &cur_comments_load, &snapshots_load);
@@ -1681,6 +1815,8 @@ fn app() -> Html {
                                                     let machine = parse_tla(&snap_source);
                                                     sim_chain.set(vec![machine.start_state()]);
                                                     comment_target.set(None);
+                                                    set_url_local();
+                                                    origin_load.set(DocumentOrigin::Local);
                                                     show_toast("Loaded!");
                                                 });
                                                 let snap_artifact = build_file_artifact(&snap.name, &snap.source, &snap.comments, snap.hash);
@@ -1716,41 +1852,138 @@ fn app() -> Html {
                                             }) }
                                         </div>
                                     }} }
+                                </div>
 
-                                    <div class="versions-import">
-                                        <h3 class="section-title" style="margin:0;font-size:14px">{"Import a version"}</h3>
-                                        <div class="import-row">
-                                            <textarea class="code-area import-area" placeholder="Paste exported version JSON here..." value={(*import_text).clone()} oninput={on_import_text} />
-                                            <button class="btn btn-primary" onclick={on_import}>{"Import"}</button>
-                                        </div>
-                                        { if let Some(ref msg) = *import_msg {
-                                            html! { <span class="import-msg">{msg}</span> }
-                                        } else { html!{} } }
+                                // ── Import card (pinned) ──
+                                <div class="versions-card versions-card-fixed">
+                                    <h3 class="versions-card-title">{"Import a version"}</h3>
+                                    <div class="import-row">
+                                        <textarea class="code-area import-area" placeholder="Paste exported version JSON here..." value={(*import_text).clone()} oninput={on_import_text} />
+                                        <button class="btn btn-primary" onclick={on_import}>{"Import"}</button>
                                     </div>
+                                    { if let Some(ref msg) = *import_msg {
+                                        html! { <span class="import-msg">{msg}</span> }
+                                    } else { html!{} } }
+                                </div>
 
-                                    <div class="versions-import">
-                                        <h3 class="section-title" style="margin:0;font-size:14px">{"Full workspace backup"}</h3>
-                                        <div class="import-row">
-                                            <button class="btn btn-secondary copy-wrap" onclick={on_ws_export}>{"Copy workspace to clipboard"}</button>
-                                        </div>
-                                        <div class="import-row">
-                                            <textarea class="code-area import-area" placeholder="Paste workspace JSON to restore everything..." value={(*ws_import_text).clone()} oninput={on_ws_import_text} />
-                                            <button class="btn btn-primary" onclick={on_ws_import}>{"Restore"}</button>
-                                        </div>
-                                        { if let Some(ref msg) = *ws_import_msg {
-                                            html! { <span class="import-msg">{msg}</span> }
-                                        } else { html!{} } }
+                                // ── Workspace backup card (pinned) ──
+                                <div class="versions-card versions-card-fixed">
+                                    <h3 class="versions-card-title">{"Full workspace backup"}</h3>
+                                    <div class="import-row">
+                                        <button class="btn btn-secondary copy-wrap" onclick={on_ws_export}>{"Copy workspace to clipboard"}</button>
                                     </div>
+                                    <div class="import-row">
+                                        <textarea class="code-area import-area" placeholder="Paste workspace JSON to restore everything..." value={(*ws_import_text).clone()} oninput={on_ws_import_text} />
+                                        <button class="btn btn-primary" onclick={on_ws_import}>{"Restore"}</button>
+                                    </div>
+                                    { if let Some(ref msg) = *ws_import_msg {
+                                        html! { <span class="import-msg">{msg}</span> }
+                                    } else { html!{} } }
+                                </div>
+                            </div>
+                        }} else { html!{} } }
+
+                        // ═══ PANEL: Guide ═══
+                        { if tab == "guide" { html! {
+                            <div class="tab-panel panel-fill">
+                                <div class="versions-card guide-scroll">
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Overview"}</h2>
+                                    <p class="guide-body">{"TLA+ Process Studio represents business processes as finite state machines using a subset of the TLA+ specification language. A process description is parsed into named states and labeled transitions, rendered as an interactive diagram, and simulated step by step."}</p>
+                                    <p class="guide-body">{"The application runs entirely in the browser. No data is transmitted to a server. Source text, comments, and snapshots are persisted in localStorage. Collaboration is supported through shareable URLs (spec + comments encoded in the fragment hash) and exportable workspace JSON files."}</p>
                                 </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"State Machines and Business Processes"}</h2>
+                                    <p class="guide-body">{"A state machine defines a system as a finite set of states and a set of transitions between them. Each transition has a label and connects one state to another. The model is complete when every state accounts for every expected transition, and every transition leads to a defined state."}</p>
+                                    <p class="guide-body">{"Business processes\u{00A0}\u{2014}\u{00A0}hiring pipelines, insurance claims, incident response, procurement workflows\u{00A0}\u{2014}\u{00A0}can be described this way. Representing a process as a state machine makes the structure explicit: which states exist, which transitions connect them, and where transitions are missing or ambiguous."}</p>
+                                    <p class="guide-body">{"State machines as a computational model date to the 1950s (Mealy, Moore). Lamport\u{2019}s TLA+ (1999), built on his Temporal Logic of Actions (1994), provides a formalism for specifying systems using state machines and temporal logic. This tool uses a subset of TLA+ syntax as its input format."}</p>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Workflow"}</h2>
+                                    <ol class="guide-steps">
+                                        <li><strong>{"Describe"}</strong>{" \u{2014} Use the Prompts tab to copy a structured prompt into an LLM. The prompt constrains output to the TLA+ subset the parser accepts. Paste the generated spec into the editor."}</li>
+                                        <li><strong>{"Parse"}</strong>{" \u{2014} Click Parse. The tool extracts states, transitions, and invariants, then renders the diagram."}</li>
+                                        <li><strong>{"Simulate"}</strong>{" \u{2014} The left column lists transitions available from the current state. Clicking one advances the simulation. The diagram highlights the current state and reachable states."}</li>
+                                        <li><strong>{"Comment"}</strong>{" \u{2014} The middle column shows the current state. Comments can be attached to any state, tagged with the commenter\u{2019}s name. These serve as structured feedback for revision."}</li>
+                                        <li><strong>{"Iterate"}</strong>{" \u{2014} The Iterate prompt bundles the current spec and all comments into a single revision prompt. Copying it into an LLM produces a revised spec that addresses the feedback."}</li>
+                                        <li><strong>{"Version"}</strong>{" \u{2014} Named snapshots preserve the spec and comments at a point in time. Snapshots can be loaded, copied as portable JSON, or restored from a workspace backup."}</li>
+                                    </ol>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Collaborative Review"}</h2>
+                                    <p class="guide-body">{"Different participants in a process typically have visibility into different parts of it. A state machine provides a shared artifact that each participant can walk through, identifying where the model diverges from their experience."}</p>
+                                    <p class="guide-body">{"Review can be synchronous (projecting the tool in a meeting while participants call out feedback) or asynchronous (sharing URLs or workspace exports). Comments accumulate on specific states and are preserved across revisions, creating a structured record of what was raised and where."}</p>
+                                    <p class="guide-body">{"The output of a review session is a set of state-level comments. These feed directly into the Iterate prompt, which an LLM uses to produce a revised spec. Multiple rounds of review and revision progressively reduce the gap between the model and the actual process."}</p>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Process Design"}</h2>
+                                    <p class="guide-body">{"The same workflow applies to designing new processes or redesigning existing ones. A first-draft state machine establishes the proposed structure. Participants review it against known constraints, edge cases, and failure modes. Each round of comments and revision refines the design."}</p>
+                                    <p class="guide-body">{"Because the model requires every state and transition to be named explicitly, gaps in the design are visible in the diagram: states with no outgoing transitions, transitions that depend on unstated assumptions, or parallel paths that converge on the same state with conflicting preconditions."}</p>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"LLM Integration"}</h2>
+                                    <p class="guide-body">{"The Prompts tab provides four prompts. "}<strong>{"New spec"}</strong>{" collects information about a process (actors, flows, failure modes, rules) and generates an initial TLA+ spec. "}<strong>{"Basic syntax"}</strong>{" converts freeform process descriptions into parser-compatible TLA+. "}<strong>{"Iterate"}</strong>{" bundles the current spec with all comments for structured revision. "}<strong>{"Agent"}</strong>{" includes browser selectors so an agentic tool (MCP Playwright, browser-use, etc.) can drive the UI programmatically."}</p>
+                                    <p class="guide-body">{"The LLM generates and revises the spec. Validation\u{00A0}\u{2014}\u{00A0}determining whether the model matches reality\u{00A0}\u{2014}\u{00A0}is done by the people who participate in or manage the process."}</p>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Privacy"}</h2>
+                                    <p class="guide-body">{"All parsing, simulation, and rendering happen in the browser via WebAssembly. No data is sent to any server. Shared URLs encode the spec and comments in the URL fragment, which is not transmitted to the host. Workspace exports are JSON files handled locally."}</p>
+                                    <p class="guide-body">{"When using the Prompts tab, the spec and comments are copied to the clipboard for pasting into an external LLM. The privacy characteristics of that LLM interaction are determined by whichever LLM provider is used."}</p>
+                                </section>
+
+                                <section class="guide-section">
+                                    <h2 class="guide-heading">{"Further Reading"}</h2>
+                                    <table class="guide-table">
+                                        <tbody>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://lamport.azurewebsites.net/pubs/lamport-actions.pdf" target="_blank" rel="noopener">{"Lamport, \u{201C}The Temporal Logic of Actions\u{201D} (1994)"}</a></td>
+                                                <td class="guide-table-desc">{"Introduces TLA, the temporal logic formalism underlying TLA+. Defines how to specify a system\u{2019}s behavior as a set of states and transitions constrained by temporal formulas."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://lamport.azurewebsites.net/pubs/state-machine.pdf" target="_blank" rel="noopener">{"Lamport, \u{201C}The State Machine Approach\u{201D}"}</a></td>
+                                                <td class="guide-table-desc">{"Describes how to model concurrent systems as state machines. Foundational paper on the state machine replication approach to fault tolerance."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://lamport.azurewebsites.net/tla/book.html" target="_blank" rel="noopener">{"Lamport, \u{201C}Specifying Systems\u{201D} (2002)"}</a></td>
+                                                <td class="guide-table-desc">{"Full TLA+ textbook. Free PDF from the author. Covers the complete language, well beyond the subset this tool uses."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://www.amazon.com/dp/0932633498" target="_blank" rel="noopener">{"Weinberg, \u{201C}An Introduction to General Systems Thinking\u{201D}"}</a></td>
+                                                <td class="guide-table-desc">{"Covers why decomposing a system into parts and analyzing them separately can produce incorrect conclusions. Relevant to modeling processes with feedback loops."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://www.amazon.com/dp/0932633226" target="_blank" rel="noopener">{"Weinberg, \u{201C}Quality Software Management, Vol\u{00A0}1\u{201D}"}</a></td>
+                                                <td class="guide-table-desc">{"Systems thinking applied to software organizations. Documents recurring failure patterns in process management."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://www.amazon.com/dp/0321934113" target="_blank" rel="noopener">{"DeMarco & Lister, \u{201C}Peopleware\u{201D}"}</a></td>
+                                                <td class="guide-table-desc">{"Covers the organizational factors that influence whether process changes are adopted. Based on survey data from hundreds of software projects."}</td>
+                                            </tr>
+                                            <tr>
+                                                <td class="guide-table-title"><a href="https://www.amazon.com/dp/B0DX5PLQMB" target="_blank" rel="noopener">{"Hidalgo, \u{201C}The Infinite Alphabet\u{201D}"}</a></td>
+                                                <td class="guide-table-desc">{"Examines how production costs affect the adoption of formalization tools. Argues that when the cost of specifying a system drops, lightweight tools displace heavyweight ones."}</td>
+                                            </tr>
+                                        </tbody>
+                                    </table>
+                                </section>
+
+                                </div>
                             </div>
                         }} else { html!{} } }
 
                         // ═══ MODEL TAB ═══
-                        { if panel.is_none() && tab == "model" { html! {
-                            <div class="tab-panel model-panel">
+                        { if tab == "model" { html! {
+                            <div class={classes!("tab-panel", "model-panel", if !parsed.warnings.is_empty() && !(*source).trim().is_empty() { Some("model-panel-has-warnings") } else { None })}>
 
-                                // ── Parser warnings banner ──
-                                { if !parsed.warnings.is_empty() {
+                                // ── Parser warnings banner (suppress when editor is empty) ──
+                                { if !parsed.warnings.is_empty() && !(*source).trim().is_empty() {
                                     let source_text = (*source).clone();
                                     let warnings_text = parsed.warnings.join("\n");
                                     let repair_prompt = format!(
@@ -1777,18 +2010,13 @@ fn app() -> Html {
                                     </div>
                                 }} else { html!{} } }
 
-                                // ── Simulate column (col 1) ──
-                                <section class="section section-simulate">
-                                    <div class="section-bar">
-                                        <h2 class="section-title">{"Simulate"}<span class="sim-state-inline">{&current_sim}</span></h2>
-                                        <div class="simulate-controls">
-                                            { if sim_chain.len() > 1 { html! {
-                                                <button class="btn btn-ghost" onclick={on_back.clone()}> {"\u{2190} Back"} </button>
-                                            }} else { html!{} } }
-                                            <button class="btn btn-ghost" onclick={on_reset.clone()}>{"\u{21BA} Reset"}</button>
-                                        </div>
+                                <div class="model-control-bar">
+                                    <div class="simulate-controls">
+                                        { if sim_chain.len() > 1 { html! {
+                                            <button class="btn btn-ghost" onclick={on_back.clone()}> {"\u{2190} Back"} </button>
+                                        }} else { html!{} } }
+                                        <button class="btn btn-ghost" onclick={on_reset.clone()}> {"\u{21BA} Reset"} </button>
                                     </div>
-                                    // Chain breadcrumb
                                     { if sim_chain.len() > 1 { html! {
                                         <div class="chain-breadcrumb">
                                             { for sim_chain.iter().enumerate().map(|(i, s)| {
@@ -1802,7 +2030,22 @@ fn app() -> Html {
                                             }) }
                                         </div>
                                     }} else { html!{} } }
-                                    { if available.is_empty() {
+                                    <div class="control-bar-actions">
+                                        <input class="input-sm header-snap-name" placeholder={parsed.module_name.clone()} value={snap_name_value.clone()} oninput={on_snap_name.clone()} />
+                                        <button class="tbtn tbtn-save" data-action="save-snapshot" onclick={on_save_snapshot.clone()}>{"\u{1F4BE} Save"}</button>
+                                        <button class="tbtn" onclick={on_copy_state_comments}>{"\u{1F4DD} Copy"}</button>
+                                        <button class="tbtn" onclick={on_share}>{"\u{1F517} Share"}</button>
+                                    </div>
+                                </div>
+
+                                // ── Simulate column (col 1) ──
+                                <section class="section section-simulate">
+                                    <div class="section-bar">
+                                        <h2 class="section-title">{"Simulate: Next Nodes"}</h2>
+                                    </div>
+                                    { if parsed.states.is_empty() {
+                                        html! { <p class="help-text">{"Load an example or paste a spec into the editor and click Parse."}</p> }
+                                    } else if available.is_empty() {
                                         html! { <p class="help-text">{"Terminal state \u{2014} no transitions. Reset to start over."}</p> }
                                     } else { html! {
                                         <div class="action-grid">
@@ -1846,7 +2089,7 @@ fn app() -> Html {
                                                     <div class="action-card" role="button" tabindex="0" onclick={onclick} onkeydown={onkeydown}>
                                                         <div class="action-name">{&an}</div>
                                                         <div class="action-target">{format!("\u{2192} {}", to_text)}</div>
-                                                        { cmt.map(|c| html! { <div class="action-desc">{c}</div> }).unwrap_or_default() }
+                                                        { cmt.map(|c| html! { <div class="action-desc"><span class="action-desc-label">{"Process Description: "}</span>{c}</div> }).unwrap_or_default() }
                                                     </div>
                                                 }
                                             }) }
@@ -1860,11 +2103,14 @@ fn app() -> Html {
                                     { if let Some(ref ts) = *comment_target {
                                         html! { <>
                                             <div class="section-bar">
-                                                <h2 class="section-title">{"Feedback"}<span class="sim-state-inline">{ts.clone()}</span></h2>
+                                                <h2 class="section-title">{"Feedback: Current Node"}</h2>
                                             </div>
-                                            { if let Some(desc) = current_node_comment { html! {
-                                                <div class="state-description">{desc}</div>
-                                            }} else { html!{} } }
+                                            <div class="current-node-card">
+                                                <div class="action-name">{ts.clone()}</div>
+                                                { if let Some(desc) = current_node_comment { html! {
+                                                    <div class="action-desc"><span class="action-desc-label">{"Process Description: "}</span>{desc}</div>
+                                                }} else { html!{} } }
+                                            </div>
                                             <div class="compose-card">
                                                 <textarea class="compose-textarea" placeholder={compose_placeholder.clone()} value={(*comment_draft).clone()} oninput={on_comment_draft} />
                                                 <div class="compose-submit">
@@ -1941,6 +2187,7 @@ fn app() -> Html {
                                 // ── State Diagram (col 3) ──
                                 <section class="section section-diagram">
                                     <div class="diagram-header">
+                                        <h2 class="section-title">{"State Machine Diagram: All Nodes"}</h2>
                                         <span class="states-legend">
                                             <span class="legend-dot legend-current" />{" Current"}
                                             <span class="legend-dot legend-available" />{" Available"}
@@ -2391,7 +2638,7 @@ fn render_state_diagram(
 ) -> Html {
     if parsed.states.is_empty() {
         return html! { <p class="help-text" style="text-align:center;padding:40px 20px">
-            {"Parse a spec to see the state diagram."}
+            {"Load an example from the dropdown above the editor, or read the Guide tab to get started."}
         </p> };
     }
 
@@ -2452,6 +2699,17 @@ fn render_state_diagram(
                 </g>
             }
         })).collect();
+
+    // Indicator rects for label avoidance (init arrow + terminal dots)
+    let mut indicator_rects: Vec<(f64, f64, f64, f64)> = Vec::new();
+    if let Some(&(sx, sy)) = pos.get(&start) {
+        indicator_rects.push((sx, sy - node_h / 2.0 - 13.5, 6.0, 13.5));
+    }
+    for state in parsed.states.iter().filter(|s| !from_set.contains(s.as_str())) {
+        if let Some(&(x, y)) = pos.get(state) {
+            indicator_rects.push((x, y + node_h / 2.0 + 13.5, 6.0, 13.5));
+        }
+    }
 
     // Build edge data (path string + initial label position)
     struct EdgeData {
@@ -2523,6 +2781,56 @@ fn render_state_diagram(
                 0.0
             };
             let align_threshold = node_w * 0.18;
+
+            let best_points = if let Some(wp) = graph_layout.waypoints.get(&(from.clone(), to.clone())) {
+                // Staircase routing through virtual node waypoints (Sugiyama phase 3)
+                let going_up = to_level < from_level;
+                let mut points = Vec::new();
+                if going_up {
+                    let first_wx = wp.first().map(|p| p.0).unwrap_or(tx);
+                    let last_wx = wp.last().map(|p| p.0).unwrap_or(fx);
+                    let start = node_port(fx, fy, node_w, node_h, PortSide::Top,
+                        horizontal_port_align(fx, first_wx, align_threshold));
+                    let end = node_port(tx, ty, node_w, node_h, PortSide::Bottom,
+                        horizontal_port_align(tx, last_wx, align_threshold));
+                    points.push(start);
+                    let mut prev_x = start.0;
+                    let mut cur_level = from_level;
+                    for &(wx, _) in wp.iter() {
+                        let ch = channel_y(cur_level - 1);
+                        points.push((prev_x, ch));
+                        points.push((wx, ch));
+                        prev_x = wx;
+                        cur_level -= 1;
+                    }
+                    let ch = channel_y(cur_level - 1);
+                    points.push((prev_x, ch));
+                    points.push((end.0, ch));
+                    points.push(end);
+                } else {
+                    let first_wx = wp.first().map(|p| p.0).unwrap_or(tx);
+                    let last_wx = wp.last().map(|p| p.0).unwrap_or(fx);
+                    let start = node_port(fx, fy, node_w, node_h, PortSide::Bottom,
+                        horizontal_port_align(fx, first_wx, align_threshold));
+                    let end = node_port(tx, ty, node_w, node_h, PortSide::Top,
+                        horizontal_port_align(tx, last_wx, align_threshold));
+                    points.push(start);
+                    let mut prev_x = start.0;
+                    let mut cur_level = from_level;
+                    for &(wx, _) in wp.iter() {
+                        let ch = channel_y(cur_level);
+                        points.push((prev_x, ch));
+                        points.push((wx, ch));
+                        prev_x = wx;
+                        cur_level += 1;
+                    }
+                    let ch = channel_y(cur_level);
+                    points.push((prev_x, ch));
+                    points.push((end.0, ch));
+                    points.push(end);
+                }
+                dedupe_polyline(points)
+            } else {
             let mut candidates: Vec<(Vec<(f64, f64)>, f64)> = Vec::new();
 
             if from_level == to_level {
@@ -2623,10 +2931,13 @@ fn render_state_diagram(
                     best_points = points;
                 }
             }
+            best_points
+            };
 
             let draw_points = trim_polyline_end(&best_points, 2.0);
             let d = polyline_path(&draw_points);
-            let all_rects: Vec<(f64, f64, f64, f64)> = node_rect_map.values().copied().collect();
+            let all_rects: Vec<(f64, f64, f64, f64)> = node_rect_map.values().copied()
+                .chain(indicator_rects.iter().copied()).collect();
             let (base_lx, base_ly_raw, label_is_horizontal) = polyline_label_anchor(&draw_points, &label, &all_rects, view_bounds);
             let base_ly = base_ly_raw - 6.0;
             edge_data.push(EdgeData {
@@ -2651,7 +2962,8 @@ fn render_state_diagram(
         let pad_y = 2.0_f64;
 
         // Collect node rects for avoidance  (cx, cy, half-w, half-h)
-        let node_rects: Vec<(f64, f64, f64, f64)> = node_rect_map.values().copied().collect();
+        let node_rects: Vec<(f64, f64, f64, f64)> = node_rect_map.values().copied()
+            .chain(indicator_rects.iter().copied()).collect();
 
         for _ in 0..6 {
             // Push labels away from nodes
@@ -2884,7 +3196,7 @@ fn copy_to_clipboard(text: &str) {
         let clipboard = window.navigator().clipboard();
         let _ = clipboard.write_text(text);
         let _ = window.alert_with_message(
-            "\u{26A0}\u{FE0F} Copied to clipboard.\n\nThis contains your spec, comments, and system design details. Be mindful when sharing \u{2014} it may expose sensitive information about your system."
+            "\u{26A0}\u{FE0F} Copied to clipboard.\n\nContains your spec, comments & system design. Be mindful when sharing."
         );
     }
 }

@@ -62,32 +62,6 @@
     </title>
     <link data-trunk rel="copy-file" href="style.css" />
     <link rel="stylesheet" href="style.css" />
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
-    <script>
-      mermaid.initialize({ startOnLoad: false, securityLevel: "loose" })
-      window.renderMermaid = async function (code) {
-        const el = document.getElementById("mermaid-target")
-        if (!el) return
-        const dark = window.matchMedia("(prefers-color-scheme: dark)").matches
-        mermaid.initialize({
-          startOnLoad: false,
-          theme: dark ? "dark" : "default",
-          securityLevel: "loose"
-        })
-        try {
-          // Remove previous render to avoid ID conflicts
-          const old = document.getElementById("mermaid-graph")
-          if (old) old.remove()
-          const { svg } = await mermaid.render("mermaid-graph", code)
-          el.innerHTML = svg
-        } catch (e) {
-          el.innerHTML =
-            '<p style="color:var(--warn);padding:14px">Diagram error: ' +
-            e.message +
-            "</p>"
-        }
-      }
-    </script>
     <script>
       /* ── Zoom / Pan for .diagram-view (viewBox-based for crisp SVG) ── */
       window.initDiagramZoom = function () {
@@ -223,32 +197,43 @@
           { passive: false }
         )
 
-        // Drag to pan
+        // Drag to pan (with click-through: only capture after 4px movement)
+        let pendingDrag = false
+        let pendingPointerId = 0
         view.addEventListener("pointerdown", function (e) {
           if (e.button !== 0 && e.button !== 1) return
           if (!init()) return
-          dragging = true
+          pendingDrag = true
+          dragging = false
           dragStartX = e.clientX
           dragStartY = e.clientY
           dragVx = vx
           dragVy = vy
-          view.setPointerCapture(e.pointerId)
-          view.classList.add("dragging")
-          e.preventDefault()
+          pendingPointerId = e.pointerId
         })
         view.addEventListener("pointermove", function (e) {
-          if (!dragging) return
+          if (!pendingDrag && !dragging) return
+          if (!dragging) {
+            const dx = e.clientX - dragStartX
+            const dy = e.clientY - dragStartY
+            if (dx * dx + dy * dy < 16) return
+            dragging = true
+            pendingDrag = false
+            view.setPointerCapture(pendingPointerId)
+            view.classList.add("dragging")
+          }
           const frac = pxToVB()
-          // Drag moves viewBox opposite to pointer direction
           vx = dragVx - (e.clientX - dragStartX) * frac.sx
           vy = dragVy - (e.clientY - dragStartY) * frac.sy
           apply()
         })
         view.addEventListener("pointerup", function () {
+          pendingDrag = false
           dragging = false
           view.classList.remove("dragging")
         })
         view.addEventListener("pointercancel", function () {
+          pendingDrag = false
           dragging = false
           view.classList.remove("dragging")
         })

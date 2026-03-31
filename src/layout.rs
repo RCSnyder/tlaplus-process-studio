@@ -21,6 +21,13 @@ pub struct DiagramLayout {
     pub pad: f64,
     pub init_space: f64,
     pub v_gap: f64,
+    pub waypoints: BTreeMap<(String, String), Vec<(f64, f64)>>,
+}
+
+const VIRTUAL_NODE_W: f64 = 10.0;
+
+fn is_virtual_node(name: &str) -> bool {
+    name.starts_with("__v_")
 }
 
 pub fn compute_state_diagram_layout(parsed: &ParsedMachine) -> DiagramLayout {
@@ -35,7 +42,10 @@ pub fn compute_state_diagram_layout(parsed: &ParsedMachine) -> DiagramLayout {
         &edge_pairs,
         preferred_level_width(parsed.states.len()),
     );
-    let ordered_levels = order_levels(&parsed.states, &edge_pairs, &depths);
+    // Phase 3 of Sugiyama: insert virtual nodes for long edges, then order
+    let (expanded_states, expanded_edges, expanded_depths, virtual_chains) =
+        insert_virtual_nodes(&edge_pairs, &depths);
+    let ordered_levels = order_levels(&expanded_states, &expanded_edges, &expanded_depths);
 
     let char_w = 7.2_f64;
     let max_label_len = parsed.states.iter().map(|s| s.len()).max().unwrap_or(8);
@@ -49,13 +59,17 @@ pub fn compute_state_diagram_layout(parsed: &ParsedMachine) -> DiagramLayout {
     let side_label_width = (max_edge_label_len * 6.2).max(56.0) + 18.0;
     let left_label_gutter = (side_label_width * 0.55).clamp(46.0, 120.0);
     let right_label_gutter = (side_label_width * 0.75).clamp(58.0, 160.0);
-    let level_gaps = compute_level_gaps(&ordered_levels, &depths, &edge_groups, h_gap, max_edge_label_len);
+    let level_gaps = compute_level_gaps(&ordered_levels, &expanded_depths, &edge_groups, h_gap, max_edge_label_len);
 
     let layout_w = ordered_levels
         .iter()
         .map(|(level, states)| {
             let gaps = level_gaps.get(level).cloned().unwrap_or_default();
-            states.len() as f64 * node_w + gaps.iter().sum::<f64>()
+            let total_nw: f64 = states
+                .iter()
+                .map(|s| if is_virtual_node(s) { VIRTUAL_NODE_W } else { node_w })
+                .sum();
+            total_nw + gaps.iter().sum::<f64>()
         })
         .fold(node_w, f64::max)
         + pad * 2.0;
@@ -64,18 +78,41 @@ pub fn compute_state_diagram_layout(parsed: &ParsedMachine) -> DiagramLayout {
     let total_w = left_label_gutter + layout_w + right_label_gutter + self_loop_gutter;
     let total_h = (ordered_levels.len() as f64) * (node_h + v_gap) - v_gap + pad * 2.0 + init_space;
 
-    let mut positions = BTreeMap::new();
+    let mut all_positions = BTreeMap::new();
     for (level, states) in &ordered_levels {
         let gaps = level_gaps.get(level).cloned().unwrap_or_default();
-        let row_w = states.len() as f64 * node_w + gaps.iter().sum::<f64>();
-        let x0 = left_label_gutter + (layout_w - row_w) / 2.0 + node_w / 2.0;
+        let row_w: f64 = states
+            .iter()
+            .map(|s| if is_virtual_node(s) { VIRTUAL_NODE_W } else { node_w })
+            .sum::<f64>()
+            + gaps.iter().sum::<f64>();
+        let x0 = left_label_gutter + (layout_w - row_w) / 2.0;
         let mut x = x0;
         for (index, state) in states.iter().enumerate() {
+            let w = if is_virtual_node(state) { VIRTUAL_NODE_W } else { node_w };
             let y = pad + init_space + (*level as f64) * (node_h + v_gap) + node_h / 2.0;
-            positions.insert(state.clone(), (x, y));
+            all_positions.insert(state.clone(), (x + w / 2.0, y));
             if let Some(gap) = gaps.get(index) {
-                x += node_w + *gap;
+                x += w + *gap;
             }
+        }
+    }
+
+    // Split into real node positions and virtual waypoint chains
+    let positions: BTreeMap<String, (f64, f64)> = all_positions
+        .iter()
+        .filter(|(name, _)| !is_virtual_node(name))
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    let mut waypoints = BTreeMap::new();
+    for ((from, to), chain) in &virtual_chains {
+        let points: Vec<(f64, f64)> = chain
+            .iter()
+            .filter_map(|vname| all_positions.get(vname).copied())
+            .collect();
+        if !points.is_empty() {
+            waypoints.insert((from.clone(), to.clone()), points);
         }
     }
 
@@ -98,6 +135,7 @@ pub fn compute_state_diagram_layout(parsed: &ParsedMachine) -> DiagramLayout {
         pad,
         init_space,
         v_gap,
+        waypoints,
     }
 }
 
@@ -149,6 +187,85 @@ fn build_state_graph(
     }
 
     (graph, state_to_node)
+}
+
+/// Insert virtual (dummy) nodes for edges spanning more than one level.
+///
+/// This is phase 3 of the standard Sugiyama pipeline: long edges are replaced
+/// by chains of single-level edges through virtual nodes at each intermediate
+/// rank.  The virtual nodes then participate in crossing minimization and
+/// coordinate assignment, giving long edges smooth staircase routes instead of
+/// forcing them into gutter lanes.
+fn insert_virtual_nodes(
+    edge_pairs: &[(String, String)],
+    depths: &BTreeMap<String, usize>,
+) -> (
+    Vec<String>,                              // expanded state names
+    Vec<(String, String)>,                    // expanded edge pairs
+    BTreeMap<String, usize>,                  // expanded depths
+    BTreeMap<(String, String), Vec<String>>,  // original edge → virtual chain
+) {
+    let mut expanded_depths = depths.clone();
+    let mut virtual_chains: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    let mut chain_edges: Vec<(String, String)> = Vec::new();
+    let mut long_edges: HashSet<(String, String)> = HashSet::new();
+
+    for (from, to) in edge_pairs {
+        if from == to {
+            continue;
+        }
+        let from_rank = depths.get(from).copied().unwrap_or(0);
+        let to_rank = depths.get(to).copied().unwrap_or(0);
+        let span = (from_rank as isize - to_rank as isize).unsigned_abs();
+        if span <= 1 {
+            continue;
+        }
+
+        long_edges.insert((from.clone(), to.clone()));
+
+        let going_down = to_rank > from_rank;
+        let (low, high) = if going_down {
+            (from_rank, to_rank)
+        } else {
+            (to_rank, from_rank)
+        };
+
+        let mut chain = Vec::new();
+        let mut prev = from.clone();
+
+        // Walk intermediate levels in the direction of the edge
+        let intermediate_levels: Vec<usize> = if going_down {
+            ((low + 1)..high).collect()
+        } else {
+            ((low + 1)..high).rev().collect()
+        };
+
+        for level in intermediate_levels {
+            let vname = format!("__v_{}_{}_{}", from, to, level);
+            expanded_depths.insert(vname.clone(), level);
+            chain.push(vname.clone());
+            chain_edges.push((prev, vname.clone()));
+            prev = vname;
+        }
+        chain_edges.push((prev, to.clone()));
+        virtual_chains.insert((from.clone(), to.clone()), chain);
+    }
+
+    // Expanded states: all real states + all virtual nodes
+    let mut expanded_states: Vec<String> = depths.keys().cloned().collect();
+    for chain in virtual_chains.values() {
+        expanded_states.extend(chain.iter().cloned());
+    }
+
+    // Expanded edges: short edges unchanged, long edges replaced by chains
+    let mut expanded_edges: Vec<(String, String)> = edge_pairs
+        .iter()
+        .filter(|e| !long_edges.contains(e))
+        .cloned()
+        .collect();
+    expanded_edges.extend(chain_edges);
+
+    (expanded_states, expanded_edges, expanded_depths, virtual_chains)
 }
 
 /// Classify edges as forward (tree/cross) or back-edges via DFS from the start state.
