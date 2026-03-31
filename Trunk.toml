@@ -3,7 +3,18 @@ target = "index.html"
 dist = "dist"
 public_url = "/"
 filehash = false
+no_sri = true
 
 [serve]
 port = 8080
 open = true
+csp = [
+	"script-src 'wasm-unsafe-eval' 'nonce-{{NONCE}}'",
+	"style-src 'self' 'nonce-{{NONCE}}'",
+]
+
+[watch]
+ignore = [
+	"audit-output",
+	".playwright-mcp",
+]

@@ -60,7 +60,8 @@
     <title>
       TLA+ Process Studio — Model Business Processes as State Machines
     </title>
-    <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="copy-file" href="style.css" />
+    <link rel="stylesheet" href="style.css" />
     <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
     <script>
       mermaid.initialize({ startOnLoad: false, securityLevel: "loose" })
@@ -87,29 +88,234 @@
         }
       }
     </script>
+    <script>
+      /* ── Zoom / Pan for .diagram-view (viewBox-based for crisp SVG) ── */
+      window.initDiagramZoom = function () {
+        const view = document.querySelector(".diagram-view")
+        if (!view || view._zoomInit) return
+        view._zoomInit = true
+
+        // Current viewBox state
+        let vx = 0,
+          vy = 0,
+          vw = 0,
+          vh = 0
+        let origW = 0,
+          origH = 0,
+          origX = 0,
+          origY = 0
+        let inited = false
+        let dragging = false,
+          dragStartX = 0,
+          dragStartY = 0,
+          dragVx = 0,
+          dragVy = 0
+
+        function getSvg() {
+          return view.querySelector("svg")
+        }
+
+        function init() {
+          const svg = getSvg()
+          if (!svg) return false
+          const raw = svg.getAttribute("viewBox")
+          if (!raw) return false
+          const p = raw
+            .trim()
+            .split(/[\s,]+/)
+            .map(Number)
+          if (p.length !== 4) return false
+          // Detect if SVG was re-rendered (new viewBox !== what we set)
+          if (inited) {
+            const cur =
+              vx.toFixed(1) +
+              " " +
+              vy.toFixed(1) +
+              " " +
+              vw.toFixed(1) +
+              " " +
+              vh.toFixed(1)
+            if (raw.trim() !== cur) {
+              // SVG was replaced by Yew re-render — re-read original
+              origX = p[0]
+              origY = p[1]
+              origW = p[2]
+              origH = p[3]
+              vx = origX
+              vy = origY
+              vw = origW
+              vh = origH
+            }
+            return true
+          }
+          origX = p[0]
+          origY = p[1]
+          origW = p[2]
+          origH = p[3]
+          vx = origX
+          vy = origY
+          vw = origW
+          vh = origH
+          inited = true
+          return true
+        }
+
+        function apply() {
+          const svg = getSvg()
+          if (!svg) return
+          svg.setAttribute(
+            "viewBox",
+            vx.toFixed(1) +
+              " " +
+              vy.toFixed(1) +
+              " " +
+              vw.toFixed(1) +
+              " " +
+              vh.toFixed(1)
+          )
+        }
+
+        function fitToView() {
+          vx = origX
+          vy = origY
+          vw = origW
+          vh = origH
+          apply()
+        }
+
+        // Pixel → viewBox scale factor (uniform, matching preserveAspectRatio meet)
+        function pxToVB() {
+          const rect = view.getBoundingClientRect()
+          const s = 1 / Math.min(rect.width / vw, rect.height / vh)
+          return { sx: s, sy: s }
+        }
+
+        // Wheel zoom (anchored at cursor)
+        view.addEventListener(
+          "wheel",
+          function (e) {
+            e.preventDefault()
+            if (!init()) return
+            const rect = view.getBoundingClientRect()
+            // Cursor position in viewBox coords
+            const frac = pxToVB()
+            const mx = vx + (e.clientX - rect.left) * frac.sx
+            const my = vy + (e.clientY - rect.top) * frac.sy
+            // Scale
+            const factor = e.deltaY > 0 ? 1 / 0.9 : 0.9
+            const newW = Math.min(
+              Math.max(vw * factor, origW / 8),
+              origW / 0.15
+            )
+            const newH = Math.min(
+              Math.max(vh * factor, origH / 8),
+              origH / 0.15
+            )
+            // Anchor at cursor: keep mx,my at same fractional position
+            const fx = (mx - vx) / vw
+            const fy = (my - vy) / vh
+            vx = mx - fx * newW
+            vy = my - fy * newH
+            vw = newW
+            vh = newH
+            apply()
+          },
+          { passive: false }
+        )
+
+        // Drag to pan
+        view.addEventListener("pointerdown", function (e) {
+          if (e.button !== 0 && e.button !== 1) return
+          if (!init()) return
+          dragging = true
+          dragStartX = e.clientX
+          dragStartY = e.clientY
+          dragVx = vx
+          dragVy = vy
+          view.setPointerCapture(e.pointerId)
+          view.classList.add("dragging")
+          e.preventDefault()
+        })
+        view.addEventListener("pointermove", function (e) {
+          if (!dragging) return
+          const frac = pxToVB()
+          // Drag moves viewBox opposite to pointer direction
+          vx = dragVx - (e.clientX - dragStartX) * frac.sx
+          vy = dragVy - (e.clientY - dragStartY) * frac.sy
+          apply()
+        })
+        view.addEventListener("pointerup", function () {
+          dragging = false
+          view.classList.remove("dragging")
+        })
+        view.addEventListener("pointercancel", function () {
+          dragging = false
+          view.classList.remove("dragging")
+        })
+        view.addEventListener("dblclick", function () {
+          fitToView()
+        })
+
+        // Zoom control buttons
+        var bar = view.parentElement.querySelector(".diagram-zoom-bar")
+        if (bar) {
+          bar.querySelector(".zoom-in").onclick = function () {
+            if (!init()) return
+            var cx = vx + vw / 2,
+              cy = vy + vh / 2
+            vw = Math.max(vw * 0.8, origW / 8)
+            vh = Math.max(vh * 0.8, origH / 8)
+            vx = cx - vw / 2
+            vy = cy - vh / 2
+            apply()
+          }
+          bar.querySelector(".zoom-out").onclick = function () {
+            if (!init()) return
+            var cx = vx + vw / 2,
+              cy = vy + vh / 2
+            vw = Math.min(vw / 0.8, origW / 0.15)
+            vh = Math.min(vh / 0.8, origH / 0.15)
+            vx = cx - vw / 2
+            vy = cy - vh / 2
+            apply()
+          }
+          bar.querySelector(".zoom-fit").onclick = fitToView
+        }
+      }
+    </script>
   </head>
   <body>
     <!--
-    AGENT-INSTRUCTIONS: TLA+ Process Studio — 100% client-side, zero server calls.
+    AGENT-INSTRUCTIONS: TLA+ Process Studio — Agent Interface v1
+    100% client-side. No server, no API, no auth. All state in localStorage.
 
-    READING STATE (most idiomatic approach):
-      1. localStorage.getItem("tla_studio_source")           → raw TLA+ spec text
-      2. JSON.parse(localStorage.getItem("tla_studio_comments") || "[]")
-         → [{target:"StateName", author:"Name", text:"Comment"}, ...]
-      3. document.querySelector(".editor-area").value         → current editor content
+    STABLE SELECTORS (prefer over CSS classes — these won't change):
+      [data-field="spec"]           TLA+ source textarea (read/write)
+      [data-action="parse"]         Parse button — triggers re-parse + diagram update
+      [data-action="save-snapshot"] Save current spec+comments as a named version
+      [data-parser-status]          App root attr — "ok" | "warnings" | "no-spec"
+      [data-module]                 App root attr — current parsed module name
+      [data-state-count]            App root attr — number of parsed states
 
-    WRITING STATE BACK:
-      4. Set editor value:
-         const ta = document.querySelector(".editor-area");
-         const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
-         setter.call(ta, newSpec);
-         ta.dispatchEvent(new Event('input',{bubbles:true}));
-      5. Click parse: document.querySelector(".btn-primary").click()
+    READ API:
+      localStorage.getItem("tla_studio_source")
+      JSON.parse(localStorage.getItem("tla_studio_comments") || "[]")
+      JSON.parse(localStorage.getItem("tla_studio_snapshots") || "[]")
+      document.querySelector("[data-field='spec']").value
+      document.querySelector("[data-parser-status]").dataset.parserStatus
 
-    WORKFLOW: paste TLA+ → parse → review states (Model tab) → collect comments →
-              export with iteration prompt (Tools tab) → LLM revises → paste back → repeat.
+    WRITE API (MUST use native setter — direct .value= won't fire Yew events):
+      const ta = document.querySelector("[data-field='spec']");
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value').set;
+      setter.call(ta, newSpec);
+      ta.dispatchEvent(new Event('input', {bubbles: true}));
+      document.querySelector("[data-action='parse']").click();
 
-    UI STRUCTURE: Topbar (stats+privacy) | Left pane (source editor) | Right pane (Model/Reference/Tools tabs)
+    AGENT LOOP:
+      1. Navigate to URL  2. Read spec+comments  3. Generate revised TLA+
+      4. Write via setter  5. Click parse  6. Check data-parser-status
+      7. If "warnings": fix and repeat  8. If "ok": optionally save-snapshot
+
     PRIVACY: No server, no API, no analytics, no cookies. All data in localStorage only.
     -->
     <div id="app"></div>

@@ -28,3 +28,6 @@ package-lock.json
 
 # Trunk build output
 dist/
+
+# Diagram audit output
+audit-output/
